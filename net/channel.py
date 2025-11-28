@@ -24,8 +24,8 @@ class Channel(nn.Module):
 
     def gaussian_noise_layer(self, input_layer, std, name=None):
         device = input_layer.get_device()
-        noise_real = torch.normal(mean=0.0, std=std, size=np.shape(input_layer), device=device)
-        noise_imag = torch.normal(mean=0.0, std=std, size=np.shape(input_layer), device=device)
+        noise_real = torch.normal(mean=0.0, std = std, size=np.shape(input_layer), device=device)
+        noise_imag = torch.normal(mean=0.0, std = std, size=np.shape(input_layer), device=device)
         noise = noise_real + 1j * noise_imag
         return input_layer + noise
 
@@ -40,19 +40,21 @@ class Channel(nn.Module):
             h = h.to(input_layer.get_device())
         return input_layer * h + noise
 
-
     def complex_normalize(self, x, power):
         pwr = torch.mean(x ** 2) * 2
         out = np.sqrt(power) * x / torch.sqrt(pwr)
         return out, pwr
 
-
     def forward(self, input, chan_param, avg_pwr=False):
         if avg_pwr:
             power = 1
-            channel_tx = np.sqrt(power) * input / torch.sqrt(avg_pwr * 2)
+            # [수정 1] torch.sqrt -> np.sqrt 변경
+            # avg_pwr가 True(int)일 때 torch.sqrt를 쓰면 에러가 나므로, 
+            # np.sqrt를 써서 float 상수(스칼라)로 만들어줍니다.
+            channel_tx = np.sqrt(power) * input / np.sqrt(avg_pwr * 2)
         else:
             channel_tx, pwr = self.complex_normalize(input, power=1)
+            
         input_shape = channel_tx.shape
         channel_in = channel_tx.reshape(-1)
         L = channel_in.shape[0]
@@ -60,17 +62,21 @@ class Channel(nn.Module):
         channel_output = self.complex_forward(channel_in, chan_param)
         channel_output = torch.cat([torch.real(channel_output), torch.imag(channel_output)])
         channel_output = channel_output.reshape(input_shape)
+        
         if self.chan_type == 1 or self.chan_type == 'awgn':
             noise = (channel_output - channel_tx).detach()
             noise.requires_grad = False
             channel_tx = channel_tx + noise
             if avg_pwr:
-                return channel_tx * torch.sqrt(avg_pwr * 2)
+                # [수정 2] 반환할 때도 torch.sqrt -> np.sqrt 변경
+                return channel_tx * np.sqrt(avg_pwr * 2)
             else:
                 return channel_tx * torch.sqrt(pwr)
+                
         elif self.chan_type == 2 or self.chan_type == 'rayleigh':
             if avg_pwr:
-                return channel_output * torch.sqrt(avg_pwr * 2)
+                # [수정 3] 여기도 마찬가지로 변경
+                return channel_output * np.sqrt(avg_pwr * 2)
             else:
                 return channel_output * torch.sqrt(pwr)
 

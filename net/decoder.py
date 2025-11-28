@@ -1,8 +1,22 @@
 from net.modules import *
 import torch
-from net.encoder import SwinTransformerBlock, AdaptiveModulator
+import torch.nn as nn
+from datetime import datetime
+from net.encoder import SwinTransformerBlock # BasicLayer 등은 encoder에서 가져오거나 여기에 정의
 
+class ClassificationHead(nn.Module):
+    def __init__(self, input_dim, num_classes=1000):
+        super().__init__()
+        # Global Average Pooling: (B, C, L) -> (B, C, 1)
+        self.gap = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Linear(input_dim, num_classes)
 
+    def forward(self, x):
+        # x: (B, L, C) -> (B, C, L)
+        x = x.transpose(1, 2)
+        x = self.gap(x).flatten(1) # (B, C)
+        return self.fc(x)
+    
 class BasicLayer(nn.Module):
 
     def __init__(self, dim, out_dim, input_resolution, depth, num_heads, window_size,
@@ -61,27 +75,34 @@ class BasicLayer(nn.Module):
 
 
 class SwinJSCC_Decoder(nn.Module):
-    def __init__(self, model, img_size, embed_dims, depths, num_heads, C,
-                 window_size=4, mlp_ratio=4., qkv_bias=True, qk_scale=None,
-                 norm_layer=nn.LayerNorm, ape=False, patch_norm=True,
-                 bottleneck_dim=16):
+    def __init__(self, 
+                 img_size,       # Final resolution of the reconstructed image (e.g., (256, 256))
+                 embed_dims,     # List of channel dimensions for each stage in the decoder (e.g., [384, 192, 96])
+                 depths,         # List of Swin Transformer block depths for each stage (e.g., [2, 2, 6])
+                 num_heads,      # List of attention heads for each stage
+                 C,              # [Input Channel] The channel dimension of the latent feature coming from the channel (H/16 x W/16 x C)
+                 num_classes=0,  # Number of classes for the auxiliary classification task (0 means no classification)
+                 window_size=8,  # Window size for Window Multi-head Self Attention (W-MSA)
+                 mlp_ratio=4.,   # Expansion ratio for the MLP feed-forward layer
+                 qkv_bias=True,  # If True, add a learnable bias to query, key, value
+                 qk_scale=None,  # Override default qk scale of head_dim ** -0.5 if set
+                 norm_layer=nn.LayerNorm, # Normalization layer used in blocks
+                 ape=False,      # (Unused) Absolute Position Embedding
+                 patch_norm=True,# If True, add normalization after patch merging
+                 bottleneck_dim=16, # (Unused) Legacy parameter for bottleneck dimension
+                 model=None,     # Model type identifier (e.g., 'E2E')
+                 patch_size=2,   # Patch size for initial embedding (kept for kwargs compatibility)
+                 in_chans=3      # Number of output channels for the reconstructed image (usually 3 for RGB)
+                 ):
         super().__init__()
 
         self.num_layers = len(depths)
-        self.ape = ape
         self.embed_dims = embed_dims
-        self.patch_norm = patch_norm
-        self.num_features = bottleneck_dim
-        self.mlp_ratio = mlp_ratio
         self.H = img_size[0]
         self.W = img_size[1]
         self.patches_resolution = (img_size[0] // 2 ** len(depths), img_size[1] // 2 ** len(depths))
-        num_patches = self.H // 4 * self.W // 4
-        if self.ape:
-            self.absolute_pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dims[0]))
-            trunc_normal_(self.absolute_pos_embed, std=.02)
 
-        # build layers
+        # 1. Reconstruction Layers
         self.layers = nn.ModuleList()
         for i_layer in range(self.num_layers):
             layer = BasicLayer(dim=int(embed_dims[i_layer]),
@@ -91,95 +112,63 @@ class SwinJSCC_Decoder(nn.Module):
                                depth=depths[i_layer],
                                num_heads=num_heads[i_layer],
                                window_size=window_size,
-                               mlp_ratio=self.mlp_ratio,
+                               mlp_ratio=mlp_ratio,
                                qkv_bias=qkv_bias, qk_scale=qk_scale,
                                norm_layer=norm_layer,
                                upsample=PatchReverseMerging)
             self.layers.append(layer)
             print("Decoder ", layer.extra_repr())
-        if C != None:
+
+        # Input Projection (C -> embed_dims[0])
+        if C is not None:
             self.head_list = nn.Linear(C, embed_dims[0])
+            clf_input_dim = C # C가 있으면 그걸 입력 차원으로 사용
+        else:
+            self.head_list = nn.Identity()
+            clf_input_dim = embed_dims[0] # C가 None이면 embed_dims[0] 사용
+
+        # 2. Classification Head (Optional)
+        self.num_classes = num_classes
+        if num_classes > 0:
+            # Classification은 Latent Feature(C)에서 바로 수행한다고 가정
+            self.classifier = ClassificationHead(clf_input_dim, num_classes)
         self.apply(self._init_weights)
-        self.hidden_dim = int(self.embed_dims[0] * 1.5)
-        self.layer_num = layer_num = 7
-        if model != "SwinJSCC_w/_RA":
-            self.bm_list = nn.ModuleList()
-            self.sm_list = nn.ModuleList()
-            self.sm_list.append(nn.Linear(self.embed_dims[0], self.hidden_dim))
-            for i in range(layer_num):
-                if i == layer_num - 1:
-                    outdim = self.embed_dims[0]
-                else:
-                    outdim = self.hidden_dim
-                self.bm_list.append(AdaptiveModulator(self.hidden_dim))
-                self.sm_list.append(nn.Linear(self.hidden_dim, outdim))
-            self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x, snr, model):
-        if model == 'SwinJSCC_w/o_SAandRA':
-            x = self.head_list(x)
-            for i_layer, layer in enumerate(self.layers):
-                x = layer(x)
-            B, L, N = x.shape
-            x = x.reshape(B, self.H, self.W, N).permute(0, 3, 1, 2)
-            return x
-
-        elif model == 'SwinJSCC_w/_SA':
-            B, L, C = x.size()
-            device = x.get_device()
-            x = self.head_list(x)
-            snr_cuda = torch.tensor(snr, dtype=torch.float).to(device)
-            snr_batch = snr_cuda.unsqueeze(0).expand(B, -1)
-            for i in range(self.layer_num):
-                if i == 0:
-                    temp = self.sm_list[i](x.detach())
-                else:
-                    temp = self.sm_list[i](temp)
-                bm = self.bm_list[i](snr_batch).unsqueeze(1).expand(-1, L, -1)
-                temp = temp * bm
-            mod_val = self.sigmoid(self.sm_list[-1](temp))
-            x = x * mod_val
-            for i_layer, layer in enumerate(self.layers):
-                x = layer(x)
-            B, L, N = x.shape
-            x = x.reshape(B, self.H, self.W, N).permute(0, 3, 1, 2)
-            return x
-
-        elif model == 'SwinJSCC_w/_RA':
-            for i_layer, layer in enumerate(self.layers):
-                x = layer(x)
-            B, L, N = x.shape
-            x = x.reshape(B, self.H, self.W, N).permute(0, 3, 1, 2)
-            return x
-
-        elif model == 'SwinJSCC_w/_SAandRA':
-            B, L, C = x.size()
-            device = x.get_device()
-            snr_cuda = torch.tensor(snr, dtype=torch.float).to(device)
-            snr_batch = snr_cuda.unsqueeze(0).expand(B, -1)
-            for i in range(self.layer_num):
-                if i == 0:
-                    temp = self.sm_list[i](x.detach())
-                else:
-                    temp = self.sm_list[i](temp)
-                bm = self.bm_list[i](snr_batch).unsqueeze(1).expand(-1, L, -1)
-                temp = temp * bm
-            mod_val = self.sigmoid(self.sm_list[-1](temp))
-            x = x * mod_val
-            for i_layer, layer in enumerate(self.layers):
-                x = layer(x)
-            B, L, N = x.shape
-            x = x.reshape(B, self.H, self.W, N).permute(0, 3, 1, 2)
-            return x
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=.02)
-            if isinstance(m, nn.Linear) and m.bias is not None:
-                nn.init.constant_(m.bias, 0)
+            if m.bias is not None: nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
+
+    def forward(self, x):
+        # x: (B, L, C) - Latent Feature from Channel
+        
+        # Task 1: Classification (Latent에서 바로 수행)
+        logits = None
+        if self.num_classes > 0:
+            logits = self.classifier(x)
+
+        # Task 2: Reconstruction
+        x_recon = self.head_list(x)
+        for layer in self.layers:
+            x_recon = layer(x_recon)
+            
+        # (B, L, 3) -> (B, 3, H, W)
+        B, L, Ch = x_recon.shape
+        x_recon = x_recon.view(B, self.H, self.W, Ch).permute(0, 3, 1, 2)
+        
+        return x_recon, logits
+    
+    def update_resolution(self, H, W):
+        self.H = H * 2 ** len(self.layers)
+        self.W = W * 2 ** len(self.layers)
+        # self.patches_resolution 업데이트 필요
+        self.patches_resolution = (H, W)
+        for i_layer, layer in enumerate(self.layers):
+            layer.update_resolution(H * (2 ** i_layer),
+                                    W * (2 ** i_layer))
 
     @torch.jit.ignore
     def no_weight_decay(self):
@@ -207,8 +196,6 @@ class SwinJSCC_Decoder(nn.Module):
 def create_decoder(**kwargs):
     model = SwinJSCC_Decoder(**kwargs)
     return model
-
-
 
 def build_model(config):
     input_image = torch.ones([1, 1536, 256]).to(config.device)

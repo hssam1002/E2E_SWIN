@@ -341,3 +341,223 @@ class PatchEmbed(nn.Module):
         if self.norm is not None:
             flops += Ho * Wo * self.embed_dim
         return flops
+
+class FeatureToBitMapper(nn.Module):
+    """
+    [User Request Implementation]
+    Input: (B, L, C)
+    Process: 
+      1. Transpose & Reshape: (B, L, C) -> (B, C, L) -> (B*C, 1, H, W)
+      2. Conv2d Layers: Extract features per channel
+      3. Flatten & Linear: Map to target bit sequence length
+      4. Reshape: (B*C, Target) -> (B, C, Target)
+    """
+    def __init__(self, src_shape, target_bits_per_channel):
+        super().__init__()
+        self.H_feat, self.W_feat = src_shape
+        self.target_bits = target_bits_per_channel
+        
+        mid_channels = 4
+        
+        # 1. Conv2d Layers
+        # Input: (B*C, 1, H, W)
+        self.conv1 = nn.Conv2d(1, mid_channels, kernel_size = 3, padding = 1)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(mid_channels, mid_channels, kernel_size = 3, padding = 1)
+        
+        # 2. Projection Layer
+        # Flatten size: mid_channels * H * W
+        flat_dim = mid_channels * self.H_feat * self.W_feat
+        self.proj = nn.Linear(flat_dim, target_bits_per_channel)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # x: (B, L, C)
+        B, L, C = x.shape
+        
+        # Shape Check (Optional but recommended)
+        if L != self.H_feat * self.W_feat:
+            # Fallback logic for variable resolution
+            size = int(np.sqrt(L))
+            H, W = size, size
+        else:
+            H, W = self.H_feat, self.W_feat
+            
+        # 1. Transpose (B, L, C) -> (B, C, L) -> (B*C, 1, H, W)
+        x = x.transpose(1, 2).reshape(B * C, 1, H, W)
+        
+        # 2. Conv2d -> ReLU -> Conv2d
+        out = self.conv1(x)
+        out = self.relu(out)
+        out = self.conv2(out) # (B*C, mid, H, W)
+        
+        # 3. Flatten & Projection
+        out = out.flatten(1)  # (B*C, mid*H*W)
+        out = self.proj(out)  # (B*C, target)
+        
+        # 4. Sigmoid
+        out = self.sigmoid(out)
+        
+        # 5. Reshape back to (B, C, target)
+        out = out.view(B, C, self.target_bits)
+        
+        return out
+
+# Constellation 을 매번 update할지, 아니면 epoch가 끝나고 update를 할지에 대해서는 생각해보자
+class DigitalMapper(nn.Module):
+    def __init__(self, in_dim, feature_map_shape, M = 16, target_bits_per_channel=16, temp=1.0):
+        super().__init__()
+        self.M = M
+        self.bits_per_symbol = int(np.log2(M)) # Q
+        self.temp = temp
+        self.target_bits_per_channel = target_bits_per_channel
+        
+        # target_bits_per_channel: 각 채널(Feature) 하나가 변환될 비트 수 (Target)
+        self.bit_mapper = FeatureToBitMapper(feature_map_shape, target_bits_per_channel) # (B, C, target)
+        
+        # Constellation & Binary Map (Trainable/Fixed)
+        self.constellation_param = nn.Parameter(self._build_initial_constellation(M))
+        self.register_buffer('bin_map', self._build_binary_map(M, self.bits_per_symbol))
+
+    def _build_initial_constellation(self, M):
+        s = int(np.sqrt(M))
+        x, y = np.meshgrid(np.linspace(-1,1,s), np.linspace(-1,1,s))
+        points = (x + 1j*y).flatten()
+        points = torch.from_numpy(points).cfloat()
+        return torch.stack([points.real, points.imag], dim=1).float()
+
+    def _build_binary_map(self, M, k):
+        bin_map = np.zeros((M, k), dtype=np.float32)
+        for i in range(M):
+            bin_map[i, :] = [int(b) for b in format(i, f'0{k}b')]
+        return torch.from_numpy(bin_map)
+
+    def get_normalized_constellation(self):
+        c = self.constellation_param
+        c = c - c.mean(0, keepdim=True)
+        return c / c.pow(2).sum(1).mean().sqrt()
+
+    def forward(self, x):
+        # 1. Generate Bits: (B, C, Target)
+        p_bits = self.bit_mapper(x) # (B, C, target)
+
+        # 2. No Padding (Assuming Target % Q == 0)
+        Q = self.bits_per_symbol
+
+        # 3. Modulation coding
+        B, C, T = p_bits.shape
+        half_Q = self.bits_per_symbol // 2
+
+        # 1. 채널을 짝수(2l)와 홀수(2l-1)로 분리 (논문에 맞춰 순서 확인 필요)
+        # 논문: 2l-1(MSB), 2l(LSB) -> 코드 인덱스로는 짝수(0,2..)가 MSB, 홀수(1,3..)가 LSB라고 가정
+        p_bits_msb = p_bits[:, 0::2, :] # (B, C/2, T)
+        p_bits_lsb = p_bits[:, 1::2, :] # (B, C/2, T)
+
+        # 2. 비트 차원(T)에서 심볼 단위로 쪼개기 위해 Reshape
+        # (B, C/2, num_symbols, half_Q)
+        p_msb_grouped = p_bits_msb.view(B, C//2, -1, half_Q)
+        p_lsb_grouped = p_bits_lsb.view(B, C//2, -1, half_Q)
+
+        # 3. MSB와 LSB 결합 (Concatenate) -> (B, C/2, num_symbols, Q)
+        # 이렇게 해야 하나의 심볼에 두 채널의 정보가 섞입니다.
+        p_grouped = torch.cat([p_msb_grouped, p_lsb_grouped], dim=-1)
+        
+        # 4. Symbol Prob
+        # p_exp:   (B, C, S, 1, Q) - 예측한 비트 확률
+        # bin_exp: (1, 1, 1, M, Q) - Constellation 포인트별 비트 패턴 (d_k)
+        p_exp = p_grouped.unsqueeze(3)
+        bin_exp = self.bin_map.view(1, 1, 1, self.M, Q)
+        
+        # log pi_k = sum( d_kj * log(p_j) + (1-d_kj) * log(1-p_j) )
+        # log_probs: (B, C, S, M)
+        term1 = bin_exp * torch.log(p_exp + 1e-10)           # d=1인 경우
+        term2 = (1 - bin_exp) * torch.log(1 - p_exp + 1e-10) # d=0인 경우
+        log_probs = torch.sum(term1 + term2, dim=-1)
+        
+        # 5. Gumbel Softmax & Modulation
+        is_training = self.training
+        soft_onehot = F.gumbel_softmax(log_probs, tau=self.temp, hard=not is_training, dim=-1) # (B, C, S, M) -> v_{l,n} (Soft)
+        complex_symbols = torch.matmul(soft_onehot, self.get_normalized_constellation())
+        
+        return complex_symbols, p_bits
+    
+class DigitalDemodulator(nn.Module):
+    """
+    Calculates P(b=1|y) using Sigmoid(LLR).
+    Input: 
+      - received: (B, S, 2) 
+      - constellation: (M, 2)
+      - bin_map: (M, Q)
+      - sigma: Noise Standard Deviation
+    """
+    def __init__(self, M):
+        super().__init__()
+        self.M = M
+        self.bits_per_symbol = int(np.log2(M)) # Q
+
+    def forward(self, received, constellation, bin_map, sigma=1.0):
+            # 1. Distance
+            dist_sq = (received.unsqueeze(2) - constellation.view(1, 1, self.M, 2)).pow(2).sum(-1)
+            
+            # 2. Exponents (Log Prob)
+            sigma_sq = torch.square(sigma) if torch.is_tensor(sigma) else sigma**2
+            snr_coeff = 1.0 / (2 * sigma_sq + 1e-9)
+            exponents = -snr_coeff * dist_sq
+
+            # 3. Bit Grouping
+            bin_map_exp = bin_map.view(1, 1, self.M, self.bits_per_symbol)
+            exponents_exp = exponents.unsqueeze(-1) # (B, S, M, 1)
+            inf_mask = torch.tensor(-1e9, device=received.device)
+            
+            # C_1: bit 1
+            logits_1 = torch.where(bin_map_exp == 1, exponents_exp, inf_mask)
+            # C_0: bit 0
+            logits_0 = torch.where(bin_map_exp == 0, exponents_exp, inf_mask)
+            
+            # 4. LLR
+            # ln( Sum_{c in C1} P(y|c) ), ln( Sum_{c in C0} P(y|c) )
+            log_sum_1 = torch.logsumexp(logits_1, dim=2) # (B, S, Q)
+            log_sum_0 = torch.logsumexp(logits_0, dim=2) # (B, S, Q)
+            
+            # 5. Sigmoid (Prob P(1|y))
+            return torch.sigmoid(log_sum_1 - log_sum_0)
+
+class BitToFeatureMapper(nn.Module):
+    """
+    Inverse of FeatureToBitMapper.
+    Input: (B, C, Target) -> Output: (B, L, C)
+    """
+    def __init__(self, target_bits_per_channel, out_seq_len, out_dim):
+        super().__init__()      
+        self.target_bits = target_bits_per_channel
+        self.out_seq_len = out_seq_len
+        self.size = int(np.sqrt(out_seq_len))
+        
+        # 1. Linear Projection: Target Bits -> Intermediate Spatial
+        mid_channels = 4
+        flat_dim = mid_channels * self.size * self.size
+        self.proj = nn.Linear(target_bits_per_channel, flat_dim)
+        
+        # 2. Transpose Conv (or just Conv) to mix features
+        # (B*C, mid, H, W) -> (B*C, 1, H, W)
+        self.deconv = nn.Sequential(
+            nn.Conv2d(mid_channels, mid_channels, 3, 1, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, 1, 3, 1, 1)
+        )
+        
+    def forward(self, x):
+        # x: (B, C, Target)
+        B, C, T = x.shape
+        # 1. Flatten
+        x = x.view(B*C, -1)
+        # 2. Linear projection
+        x = self.proj(x)
+
+        # 3. Reshape for Conv
+        x = x.view(B*C, -1, self.size, self.size)
+
+        # 4. Conv
+        x = self.deconv(x)
+        # 5. Reshape back (B*C, 1, H, W) -> (B, C, L) -> (B, L, C)
+        return x.view(B, C, self.out_seq_len).transpose(1, 2)

@@ -1,152 +1,124 @@
-from torch.utils.data import Dataset
-from PIL import Image
-# import cv2
-import os
-import numpy as np
-from glob import glob
+from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms, datasets
-from torch.utils.data.dataset import Dataset
+import os
 import torch
-import math
-import torch.utils.data as data
+import numpy as np
+
+# Number of workers for data loading
 NUM_DATASET_WORKERS = 8
-SCALE_MIN = 0.75
-SCALE_MAX = 0.95
-
-
-class HR_image(Dataset):
-    files = {"train": "train", "test": "test", "val": "validation"}
-
-    def __init__(self, config, data_dir):
-        self.imgs = []
-        for dir in data_dir:
-            self.imgs += glob(os.path.join(dir, '*.jpg'))
-            self.imgs += glob(os.path.join(dir, '*.png'))
-        _, self.im_height, self.im_width = config.image_dims
-        self.crop_size = self.im_height
-        self.image_dims = (3, self.im_height, self.im_width)
-        self.transform = self._transforms()
-
-    def _transforms(self,):
-        """
-        Up(down)scale and randomly crop to `crop_size` x `crop_size`
-        """
-        transforms_list = [
-            # transforms.RandomCrop((self.im_height, self.im_width)),
-            transforms.RandomCrop((256, 256)),
-            transforms.ToTensor()]
-
-        return transforms.Compose(transforms_list)
-
-    def __getitem__(self, idx):
-        img_path = self.imgs[idx]
-        img = Image.open(img_path)
-        img = img.convert('RGB')
-        transformed = self.transform(img)
-        return transformed
-
-    def __len__(self):
-        return len(self.imgs)
-
-
-class Datasets(Dataset):
-    def __init__(self, data_dir):
-        self.data_dir = data_dir
-        self.imgs = []
-        for dir in self.data_dir:
-            self.imgs += glob(os.path.join(dir, '*.jpg'))
-            self.imgs += glob(os.path.join(dir, '*.png'))
-        self.imgs.sort()
-
-
-    def __getitem__(self, item):
-        image_ori = self.imgs[item]
-        name = os.path.basename(image_ori)
-        image = Image.open(image_ori).convert('RGB')
-        self.im_height, self.im_width = image.size
-        if self.im_height % 128 != 0 or self.im_width % 128 != 0:
-            self.im_height = self.im_height - self.im_height % 128
-            self.im_width = self.im_width - self.im_width % 128
-        self.transform = transforms.Compose([
-            transforms.CenterCrop((self.im_width, self.im_height)),
-            transforms.ToTensor()])
-        img = self.transform(image)
-        return img, name
-    def __len__(self):
-        return len(self.imgs)
-
-class CIFAR10(Dataset):
-    def __init__(self, dataset):
-        self.dataset = dataset
-        self.len = dataset.__len__()
-
-    def __getitem__(self, item):
-        return self.dataset.__getitem__(item % self.len)
-
-    def __len__(self):
-        return self.len * 10
-
 
 def get_loader(args, config):
-    if args.trainset == 'DIV2K':
-        train_dataset = HR_image(config, config.train_data_dir)
-        test_dataset = Datasets(config.test_data_dir)
-        # test_dataset = HR_image(config, config.test_data_dir)
-    elif args.trainset == 'CIFAR10':
-        dataset_ = datasets.CIFAR10
-        if config.norm is True:
+    """
+    Returns train and test data loaders based on args.trainset.
+    Supported: 'CIFAR10', 'ImageNet'
+    """
+    
+    # -----------------------------------------------------------
+    # 1. CIFAR-10 Dataset
+    # -----------------------------------------------------------
+    if args.trainset == 'CIFAR10':
+        # Transforms (Standard augmentation for CIFAR)
+        # Norm is usually optional for E2E JSCC, but can be used.
+        # Here we use basic toTensor (0~1 range) which fits most JSCC works.
+        # If config.norm is True, add Normalization.
+        
+        if config.norm:
+            mean, std = (0.5, 0.5, 0.5), (0.5, 0.5, 0.5)
             transform_train = transforms.Compose([
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),
-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
-
+                transforms.Normalize(mean, std)
+            ])
             transform_test = transforms.Compose([
                 transforms.ToTensor(),
-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
+                transforms.Normalize(mean, std)
+            ])
         else:
             transform_train = transforms.Compose([
                 transforms.RandomHorizontalFlip(),
-                transforms.ToTensor()])
-
+                transforms.ToTensor()
+            ])
             transform_test = transforms.Compose([
-                transforms.ToTensor()])
-        train_dataset = dataset_(root=config.train_data_dir,
-                                 train=True,
-                                 transform=transform_train,
-                                 download=False)
+                transforms.ToTensor()
+            ])
 
-        test_dataset = dataset_(root=config.test_data_dir,
-                                train=False,
-                                transform=transform_test,
-                                download=False)
+        # Download=True allows automatic download if not exists
+        train_dataset = datasets.CIFAR10(root=config.train_data_dir,
+                                         train=True,
+                                         transform=transform_train,
+                                         download=True)
 
-        train_dataset = CIFAR10(train_dataset)
+        test_dataset = datasets.CIFAR10(root=config.test_data_dir,
+                                        train=False,
+                                        transform=transform_test,
+                                        download=True)
+
+    # -----------------------------------------------------------
+    # 2. ImageNet-1k Dataset
+    # -----------------------------------------------------------
+    elif args.trainset == 'ImageNet':
+        # Standard ImageNet Transforms
+        # Train: RandomResizedCrop(256) -> RandomHorizontalFlip -> ToTensor
+        # Test: Resize(256) -> CenterCrop(256) -> ToTensor
+        # (Using 256x256 as per config)
+        
+        img_size = 256
+        
+        if config.norm:
+            mean, std = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
+            normalize = transforms.Normalize(mean, std)
+        else:
+            normalize = transforms.Lambda(lambda x: x) # Identity
+
+        transform_train = transforms.Compose([
+            transforms.RandomResizedCrop(img_size),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            normalize
+        ])
+
+        transform_test = transforms.Compose([
+            transforms.Resize(img_size + 32), # Resize slightly larger then crop
+            transforms.CenterCrop(img_size),
+            transforms.ToTensor(),
+            normalize
+        ])
+
+        # ImageFolder requires structure: root/class_x/image.jpg
+        train_dataset = datasets.ImageFolder(root=config.train_data_dir, 
+                                             transform=transform_train)
+        
+        test_dataset = datasets.ImageFolder(root=config.test_data_dir, 
+                                            transform=transform_test)
 
     else:
-        train_dataset = Datasets(config.train_data_dir)
-        test_dataset = Datasets(config.test_data_dir)
+        raise NotImplementedError(f"Dataset {args.trainset} not supported.")
 
+    # -----------------------------------------------------------
+    # DataLoader Creation
+    # -----------------------------------------------------------
+    
+    # Deterministic worker seeding
     def worker_init_fn_seed(worker_id):
-        seed = 10
-        seed += worker_id
+        seed = 10 + worker_id
         np.random.seed(seed)
+        torch.manual_seed(seed)
 
-    train_loader = torch.utils.data.DataLoader(dataset=train_dataset,
-                                               num_workers=NUM_DATASET_WORKERS,
-                                               pin_memory=True,
-                                               batch_size=config.batch_size,
-                                               worker_init_fn=worker_init_fn_seed,
-                                               shuffle=True,
-                                               drop_last=True)
-    if args.trainset == 'CIFAR10':
-        test_loader = data.DataLoader(dataset=test_dataset,
-                                  batch_size=1024,
-                                  shuffle=False)
+    train_loader = DataLoader(dataset=train_dataset,
+                              batch_size=config.batch_size,
+                              shuffle=True,
+                              num_workers=NUM_DATASET_WORKERS,
+                              pin_memory=True,
+                              worker_init_fn=worker_init_fn_seed,
+                              drop_last=True)
 
-    else:
-        test_loader = torch.utils.data.DataLoader(dataset=test_dataset,
-                                              batch_size=1,
-                                              shuffle=False)
+    # Test batch size can be larger
+    test_batch_size = config.batch_size * 2 if args.trainset == 'CIFAR10' else config.batch_size
+    
+    test_loader = DataLoader(dataset=test_dataset,
+                             batch_size=test_batch_size,
+                             shuffle=False,
+                             num_workers=NUM_DATASET_WORKERS,
+                             pin_memory=True)
 
     return train_loader, test_loader
-

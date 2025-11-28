@@ -1,0 +1,36 @@
+# --- Python 기본 ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- VS Code 설정 파일 (내 컴퓨터 설정이 공유되면 안 됨) ---
+.vscode/
+
+# --- 데이터셋 및 무거운 파일 (Git에 올리기엔 너무 큼) ---
+data/
+datasets/
+/data4/             # 절대 경로로 지정된 데이터 폴더 방지
+
+# --- 학습 결과물 (로그, 모델 가중치, 샘플 이미지) ---
+workdir/
+history/
+saved_models/
+checkpoints/
+logs/
+samples/
+
+# --- 특정 확장자 무시 ---
+*.pth
+*.model
+*.log
+*.jpg
+*.png
+*.npy
+*.npz
+
+# --- 가상환경 폴더 (있다면) ---
+env/
+venv/
+envs/
+.env
