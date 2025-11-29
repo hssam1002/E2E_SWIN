@@ -28,7 +28,6 @@ class AverageMeter:
         self.sum = 0
         self.count = 0
 
-
 def logger_configuration(config, save_log=False, test_mode=False):
     # logger
     logger = logging.getLogger("Deep joint source channel coder")
@@ -58,7 +57,6 @@ def makedirs(directory):
 
 def save_model(model, save_path):
     torch.save(model.state_dict(), save_path)
-
 
 def seed_torch(seed=1029):
     random.seed(seed)

@@ -4,12 +4,15 @@ from data.datasets import get_loader
 from utils import *
 from loss.distortion import Distortion, MS_SSIM
 from torch.utils.checkpoint import checkpoint
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
 import os
 import torch
 import torch.nn as nn
 import argparse
 import time
 import numpy as np
+import matplotlib.pyplot as plt
 from datetime import datetime
 
 # --- 1. Arguments Configuration ---
@@ -57,17 +60,27 @@ parser.add_argument('--multiple-snr', type=str, default='10',
                     help='Training SNR (dB). e.g., "10" or "0,10,20"')
 
 # [Info-Max Parameters]
-parser.add_argument('--beta', type=float, default=1.0, 
+parser.add_argument('--beta', type=float, default=2500.0, 
                     help='Weight for MSE term in Info calculation (Info = -CE - beta*MSE).')
+parser.add_argument('--alpha_mode', type=str, default='linear', 
+                    choices=['linear', 'inverse', 'square', 'exponential', 'uniform'],
+                    help='Decaying mode for alpha sequence.')
+# ALM on/off 옵션
+parser.add_argument('--use_alm', type=int, default=1,
+                    choices=[0, 1],
+                    help='Enable (1) or disable (0) ALM-based constraints.')
+
 parser.add_argument('--sample_num', type=int, default=1, 
                     help='Number of Monte-Carlo samples (R) for expectation approximation.')
 
 args = parser.parse_args()
 
 # --- Global Variables for ALM ---
+# rho, gamma, lambda_l, prev_h_norm are used when ALM is enabled.
 rho = 1.0       
 gamma = 1.2     
 lambda_l = None 
+prev_h_norm = None  # 지난 epoch의 제약 norm (for rho update)
 
 # Parse SNR list
 if isinstance(args.multiple_snr, str): snr_list = [int(s) for s in args.multiple_snr.split(',')]
@@ -96,9 +109,9 @@ class config():
 
     normalize = False
     learning_rate = 0.0001
-    tot_epoch = 1000000
+    tot_epoch = 500
 
-    print_step = 1
+    print_step = 50
 
     # [Data Path Resolution]
     # Use arguments if provided, else use default server paths
@@ -165,6 +178,39 @@ class config():
 # Loss Setup: Reconstruction metric is implicit (MSE), but MS-SSIM is useful for logging
 CalcuSSIM = MS_SSIM(window_size=3, data_range=1., levels=4, channel=3).cuda()
 
+# Alpha Sequence
+def get_alpha_sequence(L, mode='linear', device='cuda'):
+    """
+    Generate decaying alpha sequence with length L and sum 1.
+    Modes: 'linear', 'inverse', 'square', 'exponential', 'uniform'
+    """
+    if mode == 'linear':
+        # [L, L-1, ..., 1]
+        v = torch.linspace(L, 1, steps=L)
+        
+    elif mode == 'inverse':
+        # [1, 1/2, 1/3, ...]
+        v = 1.0 / torch.arange(1, L + 1, dtype=torch.float32)
+        
+    elif mode == 'square':
+        # [1, 1/4, 1/9, ...]
+        v = 1.0 / (torch.arange(1, L + 1, dtype=torch.float32) ** 2)
+        
+    elif mode == 'exponential':
+        # [e^0, e^-1, e^-2, ...]
+        v = torch.exp(-torch.arange(0, L, dtype=torch.float32))
+        
+    elif mode == 'uniform':
+        # [1, 1, 1, ...] (기존 평균값 방식)
+        v = torch.ones(L, dtype=torch.float32)
+        
+    else:
+        raise ValueError(f"Unknown alpha mode: {mode}")
+
+    # Normalize to sum = 1
+    alpha = v / v.sum()
+    return alpha.to(device)
+
 # --- 3. Training Loop ---
 def train_one_epoch(args):
     """
@@ -172,28 +218,51 @@ def train_one_epoch(args):
     Formula: Info = E[log p(y|z) - beta * ||x - x_hat||^2]
              Info ~= -CrossEntropy - beta * MSE
     """
-    global rho, lambda_l, global_step, optimizer_backbone, optimizer_const
+    global rho, lambda_l, prev_h_norm, global_step, optimizer_backbone, optimizer_const
     
     net.train()
     elapsed, losses = AverageMeter(), AverageMeter()
     psnrs = AverageMeter()
     ce_losses = AverageMeter()
+    mse_losses = AverageMeter()
+    info_meter = AverageMeter()
     
     # Retrieve L (Total Steps) from Network
     if isinstance(net, nn.DataParallel): L = net.module.L
     else: L = net.L
+
+    # ALM usage flag
+    use_alm = bool(args.use_alm)
         
     # Initialize Dual Variables
     if lambda_l is None: lambda_l = torch.zeros(L).cuda()
-    alpha = torch.full((L,), 1.0 / L).cuda()
+
+    # Alpha sequence (only needed when ALM is enabled)
+    if use_alm:
+        alpha = get_alpha_sequence(L, mode=args.alpha_mode, device=config.device)
+    else:
+        alpha = None
 
     # Reset Accumulators for Epoch-wise updates
     optimizer_const.zero_grad()
-    h_accumulator = torch.zeros(L).cuda()
+    h_accumulator = torch.zeros(L, device=config.device) if use_alm else None
     num_batches = 0
 
     for batch_idx, (input_img, label) in enumerate(train_loader):
         torch.cuda.empty_cache()
+
+        # Temperature control
+        total_steps = config.tot_epoch * len(train_loader) # 전체 학습 스텝 수
+        # DataParallel 사용 시 module로 접근
+        if isinstance(net, nn.DataParallel):
+            mapper = net.module.mapper
+        else:
+            mapper = net.mapper
+
+        progress = global_step / total_steps
+        new_temp = max(0.1, np.exp(-5 * progress))
+        mapper.temp = new_temp
+
         start_time = time.time()
         global_step += 1
         num_batches += 1
@@ -209,6 +278,38 @@ def train_one_epoch(args):
         #}
         results, _ = net(input_img, current_snr, label)
         
+        if global_step % 100 == 0:
+            # 첫 번째 배치, 마지막 단계의 복원 이미지 가져오기
+            # results['recon_img']는 리스트 형태 [step1, step2, ... stepL]
+            recon_last = results['recon_img'][-1] # 가장 마지막 단계 복원 이미지
+            
+            # GPU Tensor -> CPU Numpy 변환 (첫 번째 샘플만)
+            input_np = input_img[0].permute(1, 2, 0).cpu().detach().numpy()
+            recon_np = recon_last[0].permute(1, 2, 0).cpu().detach().numpy()
+            
+            # Plotting
+            plt.figure(figsize=(10, 5))
+            
+            # (1) Original
+            plt.subplot(1, 2, 1)
+            plt.title(f"Step {global_step} Input")
+            plt.imshow(np.clip(input_np, 0, 1))
+            plt.axis('off')
+            
+            # (2) Reconstructed
+            plt.subplot(1, 2, 2)
+            plt.title(f"Step {global_step} Recon (SNR {current_snr}dB)")
+            plt.imshow(np.clip(recon_np, 0, 1))
+            plt.axis('off')
+            
+            # 저장
+            save_path = f"{config.samples}/step_{global_step}.png"
+            plt.savefig(save_path)
+            plt.close()
+            
+            if config.logger:
+                config.logger.info(f"Visualization saved at: {save_path}")
+
         # 2. Extract and Average Losses (for Multi-GPU)
         mse_list = [m.mean() for m in results['mse']]
         ce_list = [c.mean() for c in results['ce']]
@@ -226,28 +327,37 @@ def train_one_epoch(args):
             
         info_stack = torch.stack(info_vals) # (L,)
         info_L = info_stack[-1]
+
+        # Info_L 로깅용
+        info_meter.update(info_L.item())
         
-        # (Constraints calculation logic remains same)
-        denom = info_L.abs() + 1e-9
-        h_vec = []
-        for l in range(L):
-            curr_info = info_stack[l]
-            prev_info = info_stack[l-1] if l > 0 else torch.tensor(0.0).cuda()
-            h_val = ((curr_info - prev_info) / denom) - alpha[l]
-            h_vec.append(h_val)
-        h_stack = torch.stack(h_vec)
-        
-        h_accumulator += h_stack.detach()
+        # ALM constraints: only applied when use_alm == True
+        if use_alm:
+            denom = info_L.abs() + 1e-9
+            h_vec = []
+            for l in range(L):
+                curr_info = info_stack[l]
+                prev_info = info_stack[l-1] if l > 0 else torch.tensor(0.0, device=config.device)
+                h_val = ((curr_info - prev_info) / denom) - alpha[l]
+                h_vec.append(h_val)
+            h_stack = torch.stack(h_vec)
+            h_accumulator += h_stack.detach()
+        else:
+            # ALM 끈 경우, h_stack은 0 (loss에 영향 X)
+            h_stack = torch.zeros(L, device=config.device)
         
         # 4. Total Loss Combination
-        # Loss = -Info_L + Penalty + Lagrange
         loss_main = -info_L 
-        
-        penalty = (rho / 2) * torch.sum(h_stack ** 2)
-        lagrange = torch.sum(lambda_l * h_stack)
+
+        if use_alm:
+            penalty = (rho / 2) * torch.sum(h_stack ** 2)
+            lagrange = torch.sum(lambda_l * h_stack)
+        else:
+            penalty = torch.tensor(0.0, device=config.device)
+            lagrange = torch.tensor(0.0, device=config.device)
         
         total_loss = loss_main + penalty + lagrange
-        
+
         # 5. Optimization (Backbone Only)
         # Backbone is updated every batch.
         # Constellation gradients are accumulated.
@@ -259,14 +369,18 @@ def train_one_epoch(args):
         elapsed.update(time.time() - start_time)
         losses.update(total_loss.item())
         ce_losses.update(ce_list[-1].item())
+        mse_losses.update(mse_list[-1].item())
         
         if mse_list[-1].item() > 0:
-            cur_psnr = 10 * np.log10(255.**2 / mse_list[-1].item())
+            cur_psnr = 10 * np.log10(1 / mse_list[-1].item())
             psnrs.update(cur_psnr)
 
         if (global_step % config.print_step) == 0:
-            log = (f'Step {global_step} | Total Loss {losses.val:.4f} | '
-                   f'CE {ce_losses.val:.4f} | PSNR {psnrs.val:.2f} | Rho {rho:.2f}')
+            log = (f'Step {global_step} | Total {losses.val:.4f} | '
+                   f'CE {ce_losses.val:.4f} | MSE {mse_losses.val:.6f} | '
+                   f'INFO_L {info_meter.val:.4f} | PSNR {psnrs.val:.2f} | '
+                   f'Rho {rho:.2f} | Beta {args.beta} | Mode {args.alpha_mode} | '
+                   f'ALM {int(args.use_alm)}')
             logger.info(log)
 
     # --- End of Epoch Updates ---
@@ -277,12 +391,35 @@ def train_one_epoch(args):
     optimizer_const.step()
     
     # 2. Update Dual Variables (Lambda) & Penalty (Rho)
-    h_avg = h_accumulator / num_batches
-    with torch.no_grad():
-        lambda_l += rho * h_avg
-        rho = min(rho * gamma, 100.0)
+    if use_alm:
+        # Average constraint violation over the epoch
+        h_avg = h_accumulator / num_batches
+        h_norm = torch.norm(h_avg, p=2).item()
 
-    logger.info(f"Epoch End: Rho updated to {rho:.2f}")
+        # Rule-A style update for rho
+        zeta = 0.9       # how much h must shrink to keep rho
+        rho_max = 100.0  # upper bound on rho
+
+        global prev_h_norm
+        with torch.no_grad():
+            # Standard ALM lambda update
+            lambda_l += rho * h_avg
+
+            # Initialize or update rho depending on constraint progress
+            if prev_h_norm is None:
+                prev_h_norm = h_norm
+            else:
+                if h_norm > zeta * prev_h_norm:
+                    rho = min(rho * gamma, rho_max)
+                prev_h_norm = h_norm
+
+        logger.info(f"Epoch End: Rho={rho:.2f}, ||h||={h_norm:.4e}, ALM=1")
+    else:
+        # ALM 끈 경우, 평균 성능만 찍어줌
+        logger.info(
+            f"Epoch End: ALM=0 | Info_L(avg)={info_meter.avg:.4f} | "
+            f"CE(avg)={ce_losses.avg:.4f} | MSE(avg)={mse_losses.avg:.6f}"
+        )
 
 # --- 4. Validation / Test Function ---
 def validate(loader):
@@ -319,7 +456,7 @@ def validate(loader):
                 
                 # Reconstruction Metric
                 if final_mse.item() > 0:
-                    cur_psnr = 10 * np.log10(255.**2 / final_mse.item())
+                    cur_psnr = 10 * np.log10(1 / final_mse.item())
                     psnrs.update(cur_psnr)
                 
                 # Classification Metric
@@ -364,6 +501,8 @@ if __name__ == '__main__':
     
     optimizer_backbone = optim.Adam(backbone_params, lr=config.learning_rate)
     optimizer_const = optim.Adam(const_params, lr=config.learning_rate) 
+
+    #scheduler = CosineAnnealingLR(optimizer_backbone, T_max=config.tot_epoch, eta_min=1e-6)
     
     # 3. Data Loaders
     # Note: get_loader returns (train, test). We use 'test_loader' as validation during training.
@@ -379,6 +518,10 @@ if __name__ == '__main__':
         for epoch in range(config.tot_epoch):
             logger.info(f"Start Epoch {epoch}")
             train_one_epoch(args)
+            
+            #scheduler.step()
+            #current_lr = scheduler.get_last_lr()[0]
+            #logger.info(f"Epoch {epoch} Done. Current LR: {current_lr:.6f}")
             
             # Validation
             if (epoch + 1) % config.save_model_freq == 0:

@@ -7,27 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-# [1] Classification Head Definition
-class ClassificationHead(nn.Module):
-    """
-    Simple Classification Head for CrossEntropy Loss.
-    Input: Feature Map (B, L_spatial, C)
-    Process: Global Average Pooling -> Linear -> Class Logits
-    """
-    def __init__(self, input_dim, num_classes=10):
-        super().__init__()
-        # AdaptiveAvgPool1d operates on (B, C, L), so input needs transpose.
-        # Global Average Pooling removes spatial dimension L.
-        self.gap = nn.AdaptiveAvgPool1d(1)
-        self.fc = nn.Linear(input_dim, num_classes)
-
-    def forward(self, x):
-        # x: (B, L_spatial, C)
-        # Permute to (B, C, L_spatial) for pooling
-        x = x.transpose(1, 2)
-        x = self.gap(x).flatten(1) # (B, C)
-        return self.fc(x)
-
 class E2E_SwinJSCC(nn.Module):
     """
     End-to-End SwinJSCC with Digital Modulation and Progressive Transmission.

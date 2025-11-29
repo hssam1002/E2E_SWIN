@@ -184,15 +184,6 @@ class SwinJSCC_Decoder(nn.Module):
             flops += layer.flops()
         return flops
 
-    def update_resolution(self, H, W):
-        self.input_resolution = (H, W)
-        self.H = H * 2 ** len(self.layers)
-        self.W = W * 2 ** len(self.layers)
-        for i_layer, layer in enumerate(self.layers):
-            layer.update_resolution(H * (2 ** i_layer),
-                                    W * (2 ** i_layer))
-
-
 def create_decoder(**kwargs):
     model = SwinJSCC_Decoder(**kwargs)
     return model

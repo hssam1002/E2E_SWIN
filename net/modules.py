@@ -344,64 +344,55 @@ class PatchEmbed(nn.Module):
 
 class FeatureToBitMapper(nn.Module):
     """
-    [User Request Implementation]
-    Input: (B, L, C)
-    Process: 
-      1. Transpose & Reshape: (B, L, C) -> (B, C, L) -> (B*C, 1, H, W)
-      2. Conv2d Layers: Extract features per channel
-      3. Flatten & Linear: Map to target bit sequence length
-      4. Reshape: (B*C, Target) -> (B, C, Target)
+    [Deep Hashing Encoder]
+    Concept: Spatial Pooling -> Hashing Head
+    Process: Input(1,H,W) -> Conv(Light) -> GAP(1,1) -> Linear -> Bits
     """
-    def __init__(self, src_shape, target_bits_per_channel):
+    def __init__(self, src_shape, target_bits_per_channel, mid_ch=16):
         super().__init__()
         self.H_feat, self.W_feat = src_shape
         self.target_bits = target_bits_per_channel
         
-        mid_channels = 4
+        # 1. Light Feature Extractor
+        # 복잡한 연산 없이 지역 특징만 살짝 추출 (채널 1 -> mid_ch)
+        self.extract = nn.Sequential(
+            nn.Conv2d(1, mid_ch, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            # 필요한 경우 한 층 더 추가 가능하지만, 가볍게 하려면 1층으로 충분
+        )
         
-        # 1. Conv2d Layers
-        # Input: (B*C, 1, H, W)
-        self.conv1 = nn.Conv2d(1, mid_channels, kernel_size = 3, padding = 1)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(mid_channels, mid_channels, kernel_size = 3, padding = 1)
+        # 2. Global Average Pooling (The Essence of Hashing)
+        # (mid_ch, H, W) -> (mid_ch, 1, 1)
+        # 공간 정보를 하나의 벡터로 요약 (연산량 거의 0)
+        self.pool = nn.AdaptiveAvgPool2d(1)
         
-        # 2. Projection Layer
-        # Flatten size: mid_channels * H * W
-        flat_dim = mid_channels * self.H_feat * self.W_feat
-        self.proj = nn.Linear(flat_dim, target_bits_per_channel)
+        # 3. Hashing Head (Projection)
+        # Input dim: mid_ch * 1 * 1
+        self.hash_head = nn.Linear(mid_ch, target_bits_per_channel)
+        
+        # Deep Hashing에서는 보통 tanh(-1~1)를 쓰지만, 
+        # 여기서는 Gumbel-Softmax를 위해 Sigmoid(0~1) 사용
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
         # x: (B, L, C)
         B, L, C = x.shape
+        H, W = self.H_feat, self.W_feat
         
-        # Shape Check (Optional but recommended)
-        if L != self.H_feat * self.W_feat:
-            # Fallback logic for variable resolution
-            size = int(np.sqrt(L))
-            H, W = size, size
-        else:
-            H, W = self.H_feat, self.W_feat
-            
-        # 1. Transpose (B, L, C) -> (B, C, L) -> (B*C, 1, H, W)
+        # 1. Reshape: (B*C, 1, H, W) - 각 채널을 독립된 이미지로 간주
         x = x.transpose(1, 2).reshape(B * C, 1, H, W)
         
-        # 2. Conv2d -> ReLU -> Conv2d
-        out = self.conv1(x)
-        out = self.relu(out)
-        out = self.conv2(out) # (B*C, mid, H, W)
+        # 2. Extract & Pool
+        x = self.extract(x) # -> (B*C, mid_ch, H, W)
+        x = self.pool(x)    # -> (B*C, mid_ch, 1, 1)
         
-        # 3. Flatten & Projection
-        out = out.flatten(1)  # (B*C, mid*H*W)
-        out = self.proj(out)  # (B*C, target)
+        # 3. Flatten & Hash
+        x = x.flatten(1)    # -> (B*C, mid_ch)
+        x = self.hash_head(x) # -> (B*C, target_bits)
+        x = self.sigmoid(x)
         
-        # 4. Sigmoid
-        out = self.sigmoid(out)
-        
-        # 5. Reshape back to (B, C, target)
-        out = out.view(B, C, self.target_bits)
-        
-        return out
+        # 4. Reshape back
+        return x.view(B, C, self.target_bits)
 
 # Constellation 을 매번 update할지, 아니면 epoch가 끝나고 update를 할지에 대해서는 생각해보자
 class DigitalMapper(nn.Module):
@@ -524,40 +515,49 @@ class DigitalDemodulator(nn.Module):
 
 class BitToFeatureMapper(nn.Module):
     """
-    Inverse of FeatureToBitMapper.
-    Input: (B, C, Target) -> Output: (B, L, C)
+    [Deep Hashing Decoder]
+    Concept: Bits -> Expand -> Upsample (Broadcast)
+    Process: Bits -> Linear -> Reshape(1,1) -> Upsample(H,W) -> Conv -> Output
     """
-    def __init__(self, target_bits_per_channel, out_seq_len, out_dim):
+    def __init__(self, target_bits_per_channel, out_seq_len, out_dim, mid_ch=16):
         super().__init__()      
         self.target_bits = target_bits_per_channel
         self.out_seq_len = out_seq_len
-        self.size = int(np.sqrt(out_seq_len))
+        self.size = int(np.sqrt(out_seq_len)) # H, W
+        self.mid_ch = mid_ch
         
-        # 1. Linear Projection: Target Bits -> Intermediate Spatial
-        mid_channels = 4
-        flat_dim = mid_channels * self.size * self.size
-        self.proj = nn.Linear(target_bits_per_channel, flat_dim)
+        # 1. Inverse Hashing Head (Linear)
+        # Bits -> mid_ch Feature Vector
+        self.inv_hash = nn.Linear(target_bits_per_channel, mid_ch)
         
-        # 2. Transpose Conv (or just Conv) to mix features
-        # (B*C, mid, H, W) -> (B*C, 1, H, W)
-        self.deconv = nn.Sequential(
-            nn.Conv2d(mid_channels, mid_channels, 3, 1, 1),
+        # 2. Reconstruction (Refining)
+        # Upsampling된 거친 맵을 다듬는 역할
+        self.reconstruct = nn.Sequential(
+            nn.Conv2d(mid_ch, mid_ch, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(mid_channels, 1, 3, 1, 1)
+            nn.Conv2d(mid_ch, 1, kernel_size=3, padding=1)
+            # 마지막은 활성화 함수 없음 (Regression)
         )
         
     def forward(self, x):
         # x: (B, C, Target)
         B, C, T = x.shape
-        # 1. Flatten
+        H, W = self.size, self.size
+        
+        # 1. Flatten Batch*Channel & Inverse Hash
         x = x.view(B*C, -1)
-        # 2. Linear projection
-        x = self.proj(x)
-
-        # 3. Reshape for Conv
-        x = x.view(B*C, -1, self.size, self.size)
-
-        # 4. Conv
-        x = self.deconv(x)
-        # 5. Reshape back (B*C, 1, H, W) -> (B, C, L) -> (B, L, C)
+        x = self.inv_hash(x) # -> (B*C, mid_ch)
+        
+        # 2. Reshape to 1x1 Spatial
+        x = x.view(B*C, self.mid_ch, 1, 1)
+        
+        # 3. Spatial Broadcast (Upsampling)
+        # (1, 1) 벡터를 (H, W) 전체로 복사 (가장 빠른 Upsampling)
+        x = F.interpolate(x, size=(H, W), mode='nearest')
+        
+        # 4. Refine (Conv)
+        # 복사된 값들을 주변 픽셀과 섞어주며 부드럽게 만듦
+        x = self.reconstruct(x) # -> (B*C, 1, H, W)
+        
+        # 5. Reshape back
         return x.view(B, C, self.out_seq_len).transpose(1, 2)

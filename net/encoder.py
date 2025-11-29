@@ -301,12 +301,6 @@ class SwinJSCC_Encoder(nn.Module):
         flops += self.num_features * self.patches_resolution[0] * self.patches_resolution[1] // (2 ** self.num_layers)
         return flops
 
-    def update_resolution(self, H, W):
-        self.input_resolution = (H, W)
-        for i_layer, layer in enumerate(self.layers):
-            layer.update_resolution(H // (2 ** (i_layer + 1)),
-                                    W // (2 ** (i_layer + 1)))
-
 def create_encoder(**kwargs):
     model = SwinJSCC_Encoder(**kwargs)
     return model
